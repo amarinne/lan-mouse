@@ -1,50 +1,34 @@
 use crate::error::EmulationError;
 
-use super::{Emulation, error::WlrootsEmulationCreationError};
+use super::error::{WaylandBindError, WlrootsEmulationCreationError};
+use super::{Emulation, EmulationHandle};
 use async_trait::async_trait;
-use bitflags::bitflags;
-use std::collections::HashMap;
+use evdev::{
+    AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode, uinput::VirtualDevice,
+};
+use input_event::{Event, KeyboardEvent, PointerEvent};
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use wayland_client::WEnum;
 use wayland_client::backend::WaylandError;
-
-use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
-use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
-use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
+use wayland_client::{
+    Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
+    globals::{GlobalListContents, registry_queue_init},
+    protocol::wl_registry,
+};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1 as VpManager,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1 as Vp,
 };
 
-use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
-    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1 as VkManager,
-    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1 as Vk,
-};
-
-use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
-    globals::{GlobalListContents, registry_queue_init},
-    protocol::{wl_registry, wl_seat},
-};
-
-use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
-
-use super::EmulationHandle;
-use super::error::WaylandBindError;
-
 struct State {
-    keymap: Option<(u32, OwnedFd, u32)>,
     input_for_client: HashMap<EmulationHandle, VirtualInput>,
-    seat: wl_seat::WlSeat,
     qh: QueueHandle<Self>,
     vpm: VpManager,
-    vkm: VkManager,
+    keyboard: Arc<Mutex<UInputKeyboard>>,
 }
 
-// App State, implements Dispatch event handlers
 pub(crate) struct WlrootsEmulation {
     last_flush_failed: bool,
     state: State,
@@ -57,66 +41,63 @@ impl WlrootsEmulation {
         let (globals, queue) = registry_queue_init::<State>(&conn)?;
         let qh = queue.handle();
 
-        let seat: wl_seat::WlSeat = globals
-            .bind(&qh, 7..=8, ())
-            .map_err(|e| WaylandBindError::new(e, "wl_seat 7..=8"))?;
-
         let vpm: VpManager = globals
             .bind(&qh, 1..=1, ())
             .map_err(|e| WaylandBindError::new(e, "wlr-virtual-pointer-unstable-v1"))?;
-        let vkm: VkManager = globals
-            .bind(&qh, 1..=1, ())
-            .map_err(|e| WaylandBindError::new(e, "virtual-keyboard-unstable-v1"))?;
 
-        let input_for_client: HashMap<EmulationHandle, VirtualInput> = HashMap::new();
+        let keyboard = Arc::new(Mutex::new(UInputKeyboard {
+            device: create_uinput_keyboard()?,
+            raw_modifier_keys: HashSet::new(),
+            synthetic_modifiers: 0,
+        }));
+        log::info!("using uinput keyboard injection for compositor shortcut support");
 
-        let mut emulate = WlrootsEmulation {
+        Ok(Self {
             last_flush_failed: false,
             state: State {
-                keymap: None,
-                input_for_client,
-                seat,
-                vpm,
-                vkm,
+                input_for_client: HashMap::new(),
                 qh,
+                vpm,
+                keyboard,
             },
             queue,
-        };
-        while emulate.state.keymap.is_none() {
-            emulate.queue.blocking_dispatch(&mut emulate.state)?;
-        }
-        // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
-        // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
-        // log::debug!("{:?}", &mmap[..100]);
-        Ok(emulate)
+        })
     }
+}
+
+fn create_uinput_keyboard() -> io::Result<VirtualDevice> {
+    let mut keys = AttributeSet::<KeyCode>::new();
+    for code in 1..=0x2ff {
+        keys.insert(KeyCode::new(code));
+    }
+
+    VirtualDevice::builder()?
+        .name("Lan Mouse uinput keyboard and scroll")
+        .with_keys(&keys)?
+        .with_relative_axes(&AttributeSet::from_iter([
+            RelativeAxisCode::REL_X,
+            RelativeAxisCode::REL_Y,
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_HWHEEL,
+        ]))?
+        .build()
 }
 
 impl State {
     fn add_client(&mut self, client: EmulationHandle) {
         let pointer: Vp = self.vpm.create_virtual_pointer(None, &self.qh, ());
-        let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
-
-        // TODO: use server side keymap
-        if let Some((format, fd, size)) = self.keymap.as_ref() {
-            keyboard.keymap(*format, fd.as_fd(), *size);
-        } else {
-            panic!("no keymap");
-        }
-
-        let vinput = VirtualInput {
-            pointer,
-            keyboard,
-            modifiers: Arc::new(Mutex::new(XMods::empty())),
-        };
-
-        self.input_for_client.insert(client, vinput);
+        self.input_for_client.insert(
+            client,
+            VirtualInput {
+                pointer,
+                keyboard: self.keyboard.clone(),
+            },
+        );
     }
 
     fn destroy_client(&mut self, handle: EmulationHandle) {
         if let Some(input) = self.input_for_client.remove(&handle) {
             input.pointer.destroy();
-            input.keyboard.destroy();
         }
     }
 }
@@ -132,20 +113,15 @@ impl Emulation for WlrootsEmulation {
             if self.last_flush_failed {
                 match self.queue.flush() {
                     Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                        /*
-                         * outgoing buffer is full - sending more events
-                         * will overwhelm the output buffer and leave the
-                         * wayland connection in a broken state
-                         */
                         log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
                         return Ok(());
                     }
                     _ => {}
                 }
             }
-            virtual_input
-                .consume_event(event)
-                .unwrap_or_else(|_| panic!("failed to convert event: {event:?}"));
+
+            virtual_input.consume_event(event)?;
+
             match self.queue.flush() {
                 Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.last_flush_failed = true;
@@ -165,30 +141,142 @@ impl Emulation for WlrootsEmulation {
             log::error!("{e}");
         }
     }
+
     async fn destroy(&mut self, handle: EmulationHandle) {
         self.state.destroy_client(handle);
         if let Err(e) = self.queue.flush() {
             log::error!("{e}");
         }
     }
-    async fn terminate(&mut self) {
-        /* nothing to do */
-    }
+
+    async fn terminate(&mut self) {}
 }
 
 struct VirtualInput {
     pointer: Vp,
-    keyboard: Vk,
-    modifiers: Arc<Mutex<XMods>>,
+    keyboard: Arc<Mutex<UInputKeyboard>>,
+}
+
+struct UInputKeyboard {
+    device: VirtualDevice,
+    raw_modifier_keys: HashSet<u32>,
+    synthetic_modifiers: u32,
+}
+
+const MOD_SHIFT: u32 = 1 << 0;
+const MOD_CTRL: u32 = 1 << 2;
+const MOD_ALT: u32 = 1 << 3;
+const MOD_SUPER: u32 = 1 << 6;
+const FORWARDED_MODIFIERS: u32 = MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_SUPER;
+
+fn modifier_for_key(key: u32) -> u32 {
+    match key {
+        42 | 54 => MOD_SHIFT,
+        29 | 97 => MOD_CTRL,
+        56 | 100 => MOD_ALT,
+        // Caps Lock is mapped to Super in the Niri configuration on both machines.
+        58 | 125 | 126 => MOD_SUPER,
+        _ => 0,
+    }
+}
+
+fn canonical_key_for_modifier(modifier: u32) -> u16 {
+    match modifier {
+        MOD_SHIFT => 42,
+        MOD_CTRL => 29,
+        MOD_ALT => 56,
+        MOD_SUPER => 125,
+        _ => unreachable!("unsupported modifier bit"),
+    }
+}
+
+impl UInputKeyboard {
+    fn raw_modifier_mask(&self) -> u32 {
+        self.raw_modifier_keys
+            .iter()
+            .fold(0, |mask, key| mask | modifier_for_key(*key))
+    }
+
+    fn emit_key(&mut self, key: u32, state: u8) -> io::Result<()> {
+        let code = u16::try_from(key).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "keyboard keycode exceeds u16")
+        })?;
+
+        let modifier = modifier_for_key(key);
+        match state {
+            1 => {
+                if modifier != 0 {
+                    self.raw_modifier_keys.insert(key);
+                }
+            }
+            0 => {
+                self.raw_modifier_keys.remove(&key);
+            }
+            _ => {}
+        }
+
+        self.device
+            .emit(&[InputEvent::new(EventType::KEY.0, code, i32::from(state))])
+    }
+
+    fn reconcile_modifiers(&mut self, depressed: u32) -> io::Result<()> {
+        let desired = depressed & FORWARDED_MODIFIERS;
+        let raw = self.raw_modifier_mask();
+        let missing = desired & !(raw | self.synthetic_modifiers);
+        let stale = self.synthetic_modifiers & !desired;
+        let mut events = Vec::new();
+
+        for modifier in [MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_SUPER] {
+            if missing & modifier != 0 {
+                events.push(InputEvent::new(
+                    EventType::KEY.0,
+                    canonical_key_for_modifier(modifier),
+                    1,
+                ));
+                self.synthetic_modifiers |= modifier;
+            }
+            if stale & modifier != 0 {
+                events.push(InputEvent::new(
+                    EventType::KEY.0,
+                    canonical_key_for_modifier(modifier),
+                    0,
+                ));
+                self.synthetic_modifiers &= !modifier;
+            }
+        }
+
+        if events.is_empty() {
+            Ok(())
+        } else {
+            self.device.emit(&events)
+        }
+    }
+
+    fn emit_scroll(&mut self, axis: u8, value_120: i32) -> io::Result<()> {
+        let mut steps = value_120 / 120;
+        if steps == 0 && value_120 != 0 {
+            steps = value_120.signum();
+        }
+
+        let (axis, value) = match axis {
+            // Wayland vertical scroll is positive downward; Linux REL_WHEEL is positive upward.
+            0 => (RelativeAxisCode::REL_WHEEL, -steps),
+            1 => (RelativeAxisCode::REL_HWHEEL, steps),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid scroll axis",
+                ));
+            }
+        };
+
+        self.device
+            .emit(&[InputEvent::new(EventType::RELATIVE.0, axis.0, value)])
+    }
 }
 
 impl VirtualInput {
-    fn consume_event(&self, event: Event) -> Result<(), ()> {
-        let now: u32 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
-
+    fn consume_event(&self, event: Event) -> io::Result<()> {
         match event {
             Event::Pointer(e) => {
                 match e {
@@ -198,62 +286,53 @@ impl VirtualInput {
                         button,
                         state,
                     } => {
-                        let state: ButtonState = state.try_into()?;
+                        let state: ButtonState = state.try_into().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid pointer button state",
+                            )
+                        })?;
                         self.pointer.button(time, button, state);
                     }
                     PointerEvent::Axis { time, axis, value } => {
-                        let axis: Axis = (axis as u32).try_into()?;
+                        let axis: Axis = (axis as u32).try_into().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "invalid pointer axis")
+                        })?;
                         self.pointer.axis(time, axis, value);
                         self.pointer.frame();
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
-                        let axis: Axis = (axis as u32).try_into()?;
-                        self.pointer
-                            .axis_discrete(now, axis, value as f64 / 8., value / 120);
-                        self.pointer.axis_source(AxisSource::Wheel);
-                        self.pointer.frame();
+                        let mut keyboard = self
+                            .keyboard
+                            .lock()
+                            .map_err(|_| io::Error::other("uinput device lock poisoned"))?;
+                        keyboard.emit_scroll(axis, value)?;
                     }
                 }
                 self.pointer.frame();
             }
-            Event::Keyboard(e) => match e {
-                KeyboardEvent::Key { time, key, state } => {
-                    self.keyboard.key(time, key, state as u32);
-                    if let Ok(mut mods) = self.modifiers.lock() {
-                        if mods.update_by_key_event(key, state) {
-                            log::trace!("Key triggers modifier change: {mods:?}");
-                            self.keyboard.modifiers(
-                                mods.mask_pressed().bits(),
-                                0,
-                                mods.mask_locks().bits(),
-                                0,
-                            );
-                        }
-                    }
-                }
-                KeyboardEvent::Modifiers {
-                    depressed: mods_depressed,
-                    latched: mods_latched,
-                    locked: mods_locked,
-                    group,
-                } => {
-                    // Synchronize internal modifier state, assuming server is authoritative
-                    if let Ok(mut mods) = self.modifiers.lock() {
-                        mods.update_by_mods_event(e);
-                    }
-                    self.keyboard
-                        .modifiers(mods_depressed, mods_latched, mods_locked, group);
-                }
-            },
+            Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
+                let mut keyboard = self
+                    .keyboard
+                    .lock()
+                    .map_err(|_| io::Error::other("uinput keyboard lock poisoned"))?;
+                keyboard.emit_key(key, state)?;
+            }
+            Event::Keyboard(KeyboardEvent::Modifiers { depressed, .. }) => {
+                let mut keyboard = self
+                    .keyboard
+                    .lock()
+                    .map_err(|_| io::Error::other("uinput keyboard lock poisoned"))?;
+                keyboard.reconcile_modifiers(depressed)?;
+            }
         }
+
         Ok(())
     }
 }
 
 delegate_noop!(State: Vp);
-delegate_noop!(State: Vk);
 delegate_noop!(State: VpManager);
-delegate_noop!(State: VkManager);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
@@ -264,111 +343,5 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
         _: &Connection,
         _: &QueueHandle<State>,
     ) {
-    }
-}
-
-impl Dispatch<WlKeyboard, ()> for State {
-    fn event(
-        state: &mut Self,
-        _: &WlKeyboard,
-        event: <WlKeyboard as wayland_client::Proxy>::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_keyboard::Event::Keymap { format, fd, size } = event {
-            state.keymap = Some((u32::from(format), fd, size));
-        }
-    }
-}
-
-impl Dispatch<WlSeat, ()> for State {
-    fn event(
-        _: &mut Self,
-        seat: &WlSeat,
-        event: <WlSeat as wayland_client::Proxy>::Event,
-        _: &(),
-        _: &Connection,
-        qhandle: &QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities {
-            capabilities: WEnum::Value(capabilities),
-        } = event
-        {
-            if capabilities.contains(wl_seat::Capability::Keyboard) {
-                seat.get_keyboard(qhandle, ());
-            }
-        }
-    }
-}
-
-// From X11/X.h
-bitflags! {
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    struct XMods: u32 {
-        const ShiftMask = (1<<0);
-        const LockMask = (1<<1);
-        const ControlMask = (1<<2);
-        const Mod1Mask = (1<<3);
-        const Mod2Mask = (1<<4);
-        const Mod3Mask = (1<<5);
-        const Mod4Mask = (1<<6);
-        const Mod5Mask = (1<<7);
-    }
-}
-
-impl XMods {
-    fn update_by_mods_event(&mut self, evt: KeyboardEvent) {
-        if let KeyboardEvent::Modifiers {
-            depressed, locked, ..
-        } = evt
-        {
-            *self = XMods::from_bits_truncate(depressed) | XMods::from_bits_truncate(locked);
-        }
-    }
-
-    fn update_by_key_event(&mut self, key: u32, state: u8) -> bool {
-        if let Ok(key) = scancode::Linux::try_from(key) {
-            log::trace!("Attempting to process modifier from: {key:#?}");
-            let pressed_mask = match key {
-                scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-                scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-                scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
-                scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-                _ => XMods::empty(),
-            };
-
-            let locked_mask = match key {
-                scancode::Linux::KeyCapsLock => XMods::LockMask,
-                scancode::Linux::KeyNumlock => XMods::Mod2Mask,
-                scancode::Linux::KeyScrollLock => XMods::Mod3Mask,
-                _ => XMods::empty(),
-            };
-
-            // unchanged
-            if pressed_mask.is_empty() && locked_mask.is_empty() {
-                log::trace!("{key:#?} is not a modifier key");
-                return false;
-            }
-            match state {
-                1 => self.insert(pressed_mask),
-                _ => {
-                    self.remove(pressed_mask);
-                    self.toggle(locked_mask);
-                }
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    fn mask_locks(&self) -> XMods {
-        *self & (XMods::LockMask | XMods::Mod2Mask | XMods::Mod3Mask)
-    }
-
-    fn mask_pressed(&self) -> XMods {
-        *self & (XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask)
     }
 }
