@@ -46,6 +46,9 @@ ashpd = { version = "0.13.9", default-features = false, features = [
     "tokio",
 ], optional = true }
 reis = { version = "0.5.0", features = ["tokio"], optional = true }
+# raw touchpad capture: gestures are recognized on the receiving machine,
+# so the frames have to be read straight from evdev
+evdev = { version = "0.13.2", features = ["tokio"] }
 
 [target.'cfg(target_os="macos")'.dependencies]
 core-graphics = { version = "0.25.0", features = ["highsierra"] }

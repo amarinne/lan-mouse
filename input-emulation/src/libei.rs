@@ -247,6 +247,9 @@ impl Emulation for LibeiEmulation {
                 }
                 KeyboardEvent::Modifiers { .. } => {}
             },
+            // libei has no multitouch device class, so raw touchpad
+            // frames cannot be replayed through the portal
+            Event::Touchpad(_) => {}
         }
         self.context
             .flush()

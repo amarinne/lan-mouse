@@ -1,4 +1,4 @@
-use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
+use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent, TouchpadEvent};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
@@ -98,6 +98,10 @@ pub enum EventType {
     Enter,
     Leave,
     Ack,
+    /// appended after `Ack` so the discriminants of all pre-existing
+    /// events stay stable on the wire
+    TouchpadDevice,
+    TouchpadFrame,
 }
 
 impl ProtoEvent {
@@ -113,6 +117,10 @@ impl ProtoEvent {
                 InputEvent::Keyboard(k) => match k {
                     KeyboardEvent::Key { .. } => EventType::KeyboardKey,
                     KeyboardEvent::Modifiers { .. } => EventType::KeyboardModifiers,
+                },
+                InputEvent::Touchpad(t) => match t {
+                    TouchpadEvent::Device { .. } => EventType::TouchpadDevice,
+                    TouchpadEvent::Frame { .. } => EventType::TouchpadFrame,
                 },
             },
             ProtoEvent::Ping => EventType::Ping,
@@ -174,6 +182,22 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
+            EventType::TouchpadDevice => {
+                Ok(Self::Input(InputEvent::Touchpad(TouchpadEvent::Device {
+                    width_mm: decode_u16(&mut buf)?,
+                    height_mm: decode_u16(&mut buf)?,
+                    slots: decode_u8(&mut buf)?,
+                    pressure_max: decode_i32(&mut buf)?,
+                })))
+            }
+            EventType::TouchpadFrame => {
+                Ok(Self::Input(InputEvent::Touchpad(TouchpadEvent::Frame {
+                    time: decode_u32(&mut buf)?,
+                    kind: decode_u16(&mut buf)?,
+                    code: decode_u16(&mut buf)?,
+                    value: decode_i32(&mut buf)?,
+                })))
+            }
         }
     }
 }
@@ -211,6 +235,30 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         }
                         PointerEvent::AxisDiscrete120 { axis, value } => {
                             encode_u8(buf, len, axis);
+                            encode_i32(buf, len, value);
+                        }
+                    },
+                    InputEvent::Touchpad(t) => match t {
+                        TouchpadEvent::Device {
+                            width_mm,
+                            height_mm,
+                            slots,
+                            pressure_max,
+                        } => {
+                            encode_u16(buf, len, width_mm);
+                            encode_u16(buf, len, height_mm);
+                            encode_u8(buf, len, slots);
+                            encode_i32(buf, len, pressure_max);
+                        }
+                        TouchpadEvent::Frame {
+                            time,
+                            kind,
+                            code,
+                            value,
+                        } => {
+                            encode_u32(buf, len, time);
+                            encode_u16(buf, len, kind);
+                            encode_u16(buf, len, code);
                             encode_i32(buf, len, value);
                         }
                     },
@@ -257,6 +305,7 @@ macro_rules! decode_impl {
 }
 
 decode_impl!(u8);
+decode_impl!(u16);
 decode_impl!(u32);
 decode_impl!(i32);
 decode_impl!(f64);
@@ -277,6 +326,69 @@ macro_rules! encode_impl {
 }
 
 encode_impl!(u8);
+encode_impl!(u16);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// every encoded event has to fit the fixed-size datagram buffer
+    fn roundtrip(event: ProtoEvent) -> ProtoEvent {
+        let (buf, len) = <([u8; MAX_EVENT_SIZE], usize)>::from(event);
+        assert!(len <= MAX_EVENT_SIZE, "{event} overflows the event buffer");
+        ProtoEvent::try_from(buf).expect("decodes")
+    }
+
+    #[test]
+    fn touchpad_device_roundtrip() {
+        let event = ProtoEvent::Input(InputEvent::Touchpad(TouchpadEvent::Device {
+            width_mm: 162,
+            height_mm: 115,
+            slots: 5,
+            pressure_max: 511,
+        }));
+        assert!(matches!(
+            roundtrip(event),
+            ProtoEvent::Input(InputEvent::Touchpad(TouchpadEvent::Device {
+                width_mm: 162,
+                height_mm: 115,
+                slots: 5,
+                pressure_max: 511,
+            }))
+        ));
+    }
+
+    #[test]
+    fn touchpad_frame_roundtrip() {
+        // ABS_MT_TRACKING_ID = -1 (finger lifted) must survive as a
+        // negative value - a stuck slot is the worst failure mode here
+        let event = ProtoEvent::Input(InputEvent::Touchpad(TouchpadEvent::Frame {
+            time: 0xdead_beef,
+            kind: 0x03,
+            code: 0x39,
+            value: -1,
+        }));
+        assert!(matches!(
+            roundtrip(event),
+            ProtoEvent::Input(InputEvent::Touchpad(TouchpadEvent::Frame {
+                time: 0xdead_beef,
+                kind: 0x03,
+                code: 0x39,
+                value: -1,
+            }))
+        ));
+    }
+
+    #[test]
+    fn appended_event_types_keep_existing_discriminants() {
+        // both ends must agree on the wire; appending must not shift
+        // the events that existed before touchpad support
+        assert_eq!(u8::from(EventType::PointerMotion), 0);
+        assert_eq!(u8::from(EventType::Ack), 10);
+        assert_eq!(u8::from(EventType::TouchpadDevice), 11);
+        assert_eq!(u8::from(EventType::TouchpadFrame), 12);
+    }
+}

@@ -1,8 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
-    mem::swap,
-    task::{Poll, ready},
+    task::Poll,
 };
 
 use async_trait::async_trait;
@@ -32,6 +31,9 @@ mod x11;
 
 /// fallback input capture (does not produce events)
 mod dummy;
+
+#[cfg(target_os = "linux")]
+mod evdev_touchpad;
 
 pub type CaptureHandle = u64;
 
@@ -127,6 +129,12 @@ pub struct InputCapture {
     id_map: HashMap<CaptureHandle, Position>,
     /// pending events
     pending: VecDeque<(CaptureHandle, CaptureEvent)>,
+    /// raw touchpad forwarding, absent when the machine has no touchpad
+    #[cfg(target_os = "linux")]
+    touchpad: Option<evdev_touchpad::TouchpadCapture>,
+    /// handle capture is currently active for, used to route touchpad frames
+    #[cfg(target_os = "linux")]
+    active: Option<CaptureHandle>,
 }
 
 impl InputCapture {
@@ -168,6 +176,14 @@ impl InputCapture {
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
+        #[cfg(target_os = "linux")]
+        {
+            // hand the touchpad back to the local compositor
+            self.active = None;
+            if let Some(touchpad) = self.touchpad.as_mut() {
+                touchpad.ungrab();
+            }
+        }
         self.capture.release().await
     }
 
@@ -198,12 +214,55 @@ impl InputCapture {
             pending: Default::default(),
             position_map: Default::default(),
             pressed_keys: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            touchpad: evdev_touchpad::TouchpadCapture::find(),
+            #[cfg(target_os = "linux")]
+            active: None,
         })
     }
 
     /// check whether the given keys are pressed
     pub fn keys_pressed(&self, keys: &[scancode::Linux]) -> bool {
         keys.iter().all(|k| self.pressed_keys.contains(k))
+    }
+
+    /// Take the local touchpad for the duration of this capture.
+    ///
+    /// The device description is not sent here: which node is the live one is
+    /// only known once one of them reports an event, so the capture emits the
+    /// description itself, ahead of the first frame.
+    #[cfg(target_os = "linux")]
+    fn begin_touchpad_capture(&mut self, handle: CaptureHandle) {
+        self.active = Some(handle);
+        if let Some(touchpad) = self.touchpad.as_mut() {
+            touchpad.grab();
+        }
+    }
+
+    /// Route a backend event to every client sharing the edge.
+    fn dispatch(
+        &mut self,
+        pos: Position,
+        event: CaptureEvent,
+    ) -> Option<(CaptureHandle, CaptureEvent)> {
+        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
+            self.update_pressed_keys(key, state);
+        }
+
+        let ids = match self.position_map.get(&pos) {
+            Some(ids) if !ids.is_empty() => ids.clone(),
+            _ => return None,
+        };
+
+        for id in ids {
+            self.pending.push_back((id, event));
+            #[cfg(target_os = "linux")]
+            if event == CaptureEvent::Begin {
+                self.begin_touchpad_capture(id);
+            }
+        }
+
+        self.pending.pop_front()
     }
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
@@ -228,51 +287,49 @@ impl Stream for InputCapture {
             return Poll::Ready(Some(Ok(e)));
         }
 
-        // ready
-        let event = ready!(self.capture.poll_next_unpin(cx));
-
-        // stream closed
-        let event = match event {
-            Some(e) => e,
-            None => return Poll::Ready(None),
-        };
-
-        // error occurred
-        let (pos, event) = match event {
-            Ok(e) => e,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        };
-
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
+        // Poll the backend first: it registers its waker even when the
+        // touchpad is delivering a continuous stream of frames, which would
+        // otherwise starve pointer and keyboard capture during a gesture.
+        match self.capture.poll_next_unpin(cx) {
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Ok((pos, event)))) => {
+                return match self.dispatch(pos, event) {
+                    Some(event) => Poll::Ready(Some(Ok(event))),
+                    // no client on this edge - same as upstream, the
+                    // backend wakes us again on the next event
+                    None => Poll::Pending,
+                };
+            }
+            Poll::Pending => {}
         }
 
-        let len = self
-            .position_map
-            .get(&pos)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
-
-        match len {
-            0 => Poll::Pending,
-            1 => Poll::Ready(Some(Ok((
-                self.position_map.get(&pos).expect("no id")[0],
-                event,
-            )))),
-            _ => {
-                let mut position_map = HashMap::new();
-                swap(&mut self.position_map, &mut position_map);
-                {
-                    for &id in position_map.get(&pos).expect("position") {
-                        self.pending.push_back((id, event));
+        // Backend is idle: drain touchpad frames. The grab means these are
+        // the only events the local compositor is no longer seeing.
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = self.active {
+            if let Some(touchpad) = self.touchpad.as_mut() {
+                if touchpad.is_grabbed() {
+                    match touchpad.poll_event(cx) {
+                        Poll::Ready(Ok(frame)) => {
+                            return Poll::Ready(Some(Ok((
+                                handle,
+                                CaptureEvent::Input(Event::Touchpad(frame)),
+                            ))));
+                        }
+                        Poll::Ready(Err(e)) => {
+                            // keep pointer/keyboard capture alive; only
+                            // gesture forwarding is lost
+                            log::warn!("touchpad capture failed, releasing grab: {e}");
+                            touchpad.ungrab();
+                        }
+                        Poll::Pending => {}
                     }
                 }
-                swap(&mut self.position_map, &mut position_map);
-
-                Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
             }
         }
+
+        Poll::Pending
     }
 }
 

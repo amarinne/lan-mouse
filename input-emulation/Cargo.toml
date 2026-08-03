@@ -46,6 +46,7 @@ ashpd = { version = "0.13.9", default-features = false, features = [
     "tokio",
 ], optional = true }
 reis = { version = "0.5.0", features = ["tokio"], optional = true }
+evdev = { version = "0.13.2", optional = true }
 
 [target.'cfg(target_os="macos")'.dependencies]
 bitflags = "2.6.0"
@@ -68,6 +69,7 @@ windows = { version = "0.61.2", features = [
 [features]
 default = ["wlroots", "x11", "remote_desktop_portal", "libei"]
 wlroots = [
+    "dep:evdev",
     "dep:wayland-client",
     "dep:wayland-protocols",
     "dep:wayland-protocols-wlr",

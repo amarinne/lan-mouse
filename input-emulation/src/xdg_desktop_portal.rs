@@ -147,6 +147,9 @@ impl Emulation for DesktopPortalEmulation {
                     }
                 }
             }
+            // RemoteDesktop exposes no multitouch surface, so raw
+            // touchpad frames cannot be replayed through this portal
+            input_event::Event::Touchpad(_) => {}
         }
         Ok(())
     }
