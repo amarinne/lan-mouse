@@ -34,6 +34,22 @@ pub enum PointerEvent {
 /// which is what libinput needs: its gesture thresholds are expressed in mm.
 pub const TOUCHPAD_AXIS_MAX: i32 = 0xffff;
 
+/// Events carried by one [`TouchpadEvent::Frame`].
+///
+/// A single contact needs four (slot, tracking id, x, y); five fingers plus
+/// the tool and button bits and the terminating `SYN_REPORT` stay inside this
+/// bound, and anything longer is split across datagrams.
+pub const MAX_FRAME_EVENTS: usize = 24;
+
+/// One raw evdev event: type, code and value exactly as the kernel reports
+/// them, with positions rescaled to `0..=TOUCHPAD_AXIS_MAX`.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct TouchpadAxisEvent {
+    pub kind: u16,
+    pub code: u16,
+    pub value: i32,
+}
+
 /// Touchpad events, forwarded as raw evdev frames.
 ///
 /// Gestures are deliberately *not* interpreted on the capturing machine.
@@ -54,16 +70,24 @@ pub enum TouchpadEvent {
         slots: u8,
         pressure_max: i32,
     },
-    /// A single evdev event belonging to the frame currently being built.
+    /// One complete evdev frame: every event up to and including its
+    /// `EV_SYN` / `SYN_REPORT`.
     ///
-    /// `kind` and `code` are raw evdev type/code values. As on the kernel
-    /// interface, an `EV_SYN` / `SYN_REPORT` event terminates a frame and
-    /// makes it visible to the receiving compositor.
+    /// A frame is the unit that means something - a position without the
+    /// slot it belongs to, or without the `SYN_REPORT` that ends it, is not
+    /// interpretable. Sending each evdev event in its own datagram made a
+    /// touchpad cost roughly eight times the packets of a mouse and turned
+    /// any single loss into a corrupted frame rather than a skipped sample.
+    /// Keeping a frame in one datagram makes loss degrade the way it does on
+    /// the pointer path: one sample vanishes and the stream continues.
+    ///
+    /// Frames longer than [`MAX_FRAME_EVENTS`] are split; only the part
+    /// carrying the `SYN_REPORT` ends the frame, which is exactly how the
+    /// kernel interface behaves.
     Frame {
         time: u32,
-        kind: u16,
-        code: u16,
-        value: i32,
+        count: u8,
+        events: [TouchpadAxisEvent; MAX_FRAME_EVENTS],
     },
 }
 
@@ -167,10 +191,15 @@ impl Display for TouchpadEvent {
             ),
             TouchpadEvent::Frame {
                 time: _,
-                kind,
-                code,
-                value,
-            } => write!(f, "touchpad-frame({kind:#x}, {code:#x}, {value})"),
+                count,
+                events,
+            } => {
+                write!(f, "touchpad-frame({count} events")?;
+                for e in events.iter().take(*count as usize) {
+                    write!(f, "; {:#x},{:#x},{}", e.kind, e.code, e.value)?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }

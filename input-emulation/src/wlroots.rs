@@ -7,7 +7,9 @@ use evdev::{
     AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode, PropType,
     RelativeAxisCode, UinputAbsSetup, uinput::VirtualDevice,
 };
-use input_event::{Event, KeyboardEvent, PointerEvent, TOUCHPAD_AXIS_MAX, TouchpadEvent};
+use input_event::{
+    Event, KeyboardEvent, PointerEvent, TOUCHPAD_AXIS_MAX, TouchpadAxisEvent, TouchpadEvent,
+};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -51,6 +53,7 @@ impl WlrootsEmulation {
             device: create_uinput_keyboard()?,
             raw_modifier_keys: HashSet::new(),
             synthetic_modifiers: 0,
+            scroll_remainder: [0; 2],
         }));
         log::info!("using uinput keyboard injection for compositor shortcut support");
 
@@ -84,6 +87,10 @@ fn create_uinput_keyboard() -> io::Result<VirtualDevice> {
             RelativeAxisCode::REL_Y,
             RelativeAxisCode::REL_WHEEL,
             RelativeAxisCode::REL_HWHEEL,
+            // declaring the hi-res axes is what makes libinput treat this as
+            // a high-resolution wheel instead of quantizing to whole clicks
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            RelativeAxisCode::REL_HWHEEL_HI_RES,
         ]))?
         .build()
 }
@@ -306,18 +313,29 @@ impl UInputTouchpad {
         Ok(())
     }
 
-    fn emit_frame(&mut self, kind: u16, code: u16, value: i32) -> io::Result<()> {
-        // track slot state so a lost finger-up can be repaired on release
-        if kind == EV_ABS {
-            if code == AbsoluteAxisCode::ABS_MT_SLOT.0 {
-                self.current_slot = value;
-            } else if code == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 {
-                if value < 0 {
-                    self.active_slots.remove(&self.current_slot);
-                } else {
-                    self.active_slots.insert(self.current_slot);
+    /// Replay one whole frame in a single write.
+    ///
+    /// The kernel timestamps an input packet once, when its first event is
+    /// processed, and holds that stamp until the `SYN_REPORT`. Writing a
+    /// frame in one call keeps it a single packet, which is what libinput
+    /// measures velocity against.
+    fn emit_frame(&mut self, count: u8, frame: &[TouchpadAxisEvent]) -> io::Result<()> {
+        let mut events = Vec::with_capacity(count as usize);
+
+        for e in frame.iter().take(count as usize) {
+            // track slot state so a lost finger-up can be repaired on release
+            if e.kind == EV_ABS {
+                if e.code == AbsoluteAxisCode::ABS_MT_SLOT.0 {
+                    self.current_slot = e.value;
+                } else if e.code == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0 {
+                    if e.value < 0 {
+                        self.active_slots.remove(&self.current_slot);
+                    } else {
+                        self.active_slots.insert(self.current_slot);
+                    }
                 }
             }
+            events.push(InputEvent::new(e.kind, e.code, e.value));
         }
 
         let Some(device) = self.device.as_mut() else {
@@ -325,7 +343,7 @@ impl UInputTouchpad {
             // them is preferable to guessing the geometry
             return Ok(());
         };
-        device.emit(&[InputEvent::new(kind, code, value)])
+        device.emit(&events)
     }
 
     /// Lift every finger still marked down.
@@ -369,6 +387,13 @@ struct UInputKeyboard {
     device: VirtualDevice,
     raw_modifier_keys: HashSet<u32>,
     synthetic_modifiers: u32,
+    /// leftover high-resolution scroll, per axis, in 1/120 detent units
+    ///
+    /// A high-resolution wheel reports one detent as several fractional
+    /// events. Without carrying the remainder between them, each fraction has
+    /// to be rounded to a whole click, which multiplies one detent into
+    /// several.
+    scroll_remainder: [i32; 2],
 }
 
 const MOD_SHIFT: u32 = 1 << 0;
@@ -460,16 +485,30 @@ impl UInputKeyboard {
         }
     }
 
+    /// Replay a scroll event, reporting it the way a physical wheel does.
+    ///
+    /// `value_120` is in 1/120 of a detent. A high-resolution wheel - the
+    /// G502 X among them - splits a single detent into several such events
+    /// even in ratcheted mode, so rounding each one to a whole click turns
+    /// one detent into three to five and makes precise scrolling impossible.
+    ///
+    /// The kernel convention is to report both: `REL_WHEEL_HI_RES` carries
+    /// every fraction, and `REL_WHEEL` carries whole detents only, with the
+    /// remainder held until it completes one. Emitting both in a single
+    /// frame is what real mice do, and libinput expects it.
     fn emit_scroll(&mut self, axis: u8, value_120: i32) -> io::Result<()> {
-        let mut steps = value_120 / 120;
-        if steps == 0 && value_120 != 0 {
-            steps = value_120.signum();
-        }
-
-        let (axis, value) = match axis {
+        let (hi_res_code, wheel_code, delta) = match axis {
             // Wayland vertical scroll is positive downward; Linux REL_WHEEL is positive upward.
-            0 => (RelativeAxisCode::REL_WHEEL, -steps),
-            1 => (RelativeAxisCode::REL_HWHEEL, steps),
+            0 => (
+                RelativeAxisCode::REL_WHEEL_HI_RES,
+                RelativeAxisCode::REL_WHEEL,
+                -value_120,
+            ),
+            1 => (
+                RelativeAxisCode::REL_HWHEEL_HI_RES,
+                RelativeAxisCode::REL_HWHEEL,
+                value_120,
+            ),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -478,8 +517,27 @@ impl UInputKeyboard {
             }
         };
 
-        self.device
-            .emit(&[InputEvent::new(EventType::RELATIVE.0, axis.0, value)])
+        let remainder = &mut self.scroll_remainder[axis as usize];
+        *remainder += delta;
+        // truncation toward zero is what we want: a partial detent that
+        // reverses direction must not emit a click
+        let detents = *remainder / 120;
+        *remainder -= detents * 120;
+
+        let mut events = vec![InputEvent::new(
+            EventType::RELATIVE.0,
+            hi_res_code.0,
+            delta,
+        )];
+        if detents != 0 {
+            events.push(InputEvent::new(
+                EventType::RELATIVE.0,
+                wheel_code.0,
+                detents,
+            ));
+        }
+
+        self.device.emit(&events)
     }
 }
 
@@ -547,10 +605,9 @@ impl VirtualInput {
                     } => touchpad.describe(width_mm, height_mm, slots, pressure_max)?,
                     TouchpadEvent::Frame {
                         time: _,
-                        kind,
-                        code,
-                        value,
-                    } => touchpad.emit_frame(kind, code, value)?,
+                        count,
+                        events,
+                    } => touchpad.emit_frame(count, &events)?,
                 }
             }
         }

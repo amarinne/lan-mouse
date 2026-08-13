@@ -1,4 +1,7 @@
-use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent, TouchpadEvent};
+use input_event::{
+    Event as InputEvent, KeyboardEvent, MAX_FRAME_EVENTS, PointerEvent, TouchpadAxisEvent,
+    TouchpadEvent,
+};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
@@ -8,9 +11,17 @@ use std::{
 use thiserror::Error;
 
 /// defines the maximum size an encoded event can take up
-/// this is currently the pointer motion event
-/// type: u8, time: u32, dx: f64, dy: f64
-pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+/// this is currently the touchpad frame event
+/// type: u8, time: u32, count: u8, then `count` * (kind: u16, code: u16, value: i32)
+///
+/// A whole evdev frame travels in one datagram. Splitting a frame across
+/// datagrams, as an event-sized buffer forces, multiplies the packet rate by
+/// the number of events in a frame and makes every single loss corrupt a
+/// frame instead of dropping a sample.
+pub const MAX_EVENT_SIZE: usize = size_of::<u8>()
+    + size_of::<u32>()
+    + size_of::<u8>()
+    + MAX_FRAME_EVENTS * (2 * size_of::<u16>() + size_of::<i32>());
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -21,6 +32,9 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// touchpad frame claims more events than one datagram can hold
+    #[error("touchpad frame carries {0} events, max is {max}", max = MAX_FRAME_EVENTS)]
+    FrameTooLong(u8),
 }
 
 /// Position of a client
@@ -191,11 +205,21 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 })))
             }
             EventType::TouchpadFrame => {
+                let time = decode_u32(&mut buf)?;
+                let count = decode_u8(&mut buf)?;
+                if count as usize > MAX_FRAME_EVENTS {
+                    return Err(ProtocolError::FrameTooLong(count));
+                }
+                let mut events = [TouchpadAxisEvent::default(); MAX_FRAME_EVENTS];
+                for event in events.iter_mut().take(count as usize) {
+                    event.kind = decode_u16(&mut buf)?;
+                    event.code = decode_u16(&mut buf)?;
+                    event.value = decode_i32(&mut buf)?;
+                }
                 Ok(Self::Input(InputEvent::Touchpad(TouchpadEvent::Frame {
-                    time: decode_u32(&mut buf)?,
-                    kind: decode_u16(&mut buf)?,
-                    code: decode_u16(&mut buf)?,
-                    value: decode_i32(&mut buf)?,
+                    time,
+                    count,
+                    events,
                 })))
             }
         }
@@ -252,14 +276,17 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         }
                         TouchpadEvent::Frame {
                             time,
-                            kind,
-                            code,
-                            value,
+                            count,
+                            events,
                         } => {
+                            let count = count.min(MAX_FRAME_EVENTS as u8);
                             encode_u32(buf, len, time);
-                            encode_u16(buf, len, kind);
-                            encode_u16(buf, len, code);
-                            encode_i32(buf, len, value);
+                            encode_u8(buf, len, count);
+                            for event in events.iter().take(count as usize) {
+                                encode_u16(buf, len, event.kind);
+                                encode_u16(buf, len, event.code);
+                                encode_i32(buf, len, event.value);
+                            }
                         }
                     },
                     InputEvent::Keyboard(k) => match k {
@@ -361,24 +388,59 @@ mod tests {
         ));
     }
 
+    fn frame(events: &[(u16, u16, i32)]) -> TouchpadEvent {
+        let mut buf = [TouchpadAxisEvent::default(); MAX_FRAME_EVENTS];
+        for (slot, &(kind, code, value)) in buf.iter_mut().zip(events) {
+            *slot = TouchpadAxisEvent { kind, code, value };
+        }
+        TouchpadEvent::Frame {
+            time: 0xdead_beef,
+            count: events.len() as u8,
+            events: buf,
+        }
+    }
+
     #[test]
     fn touchpad_frame_roundtrip() {
         // ABS_MT_TRACKING_ID = -1 (finger lifted) must survive as a
         // negative value - a stuck slot is the worst failure mode here
-        let event = ProtoEvent::Input(InputEvent::Touchpad(TouchpadEvent::Frame {
-            time: 0xdead_beef,
-            kind: 0x03,
-            code: 0x39,
-            value: -1,
-        }));
+        let sent = frame(&[
+            (0x03, 0x2f, 0),  // ABS_MT_SLOT 0
+            (0x03, 0x39, -1), // ABS_MT_TRACKING_ID -1
+            (0x00, 0x00, 0),  // SYN_REPORT
+        ]);
+        let event = ProtoEvent::Input(InputEvent::Touchpad(sent));
+        match roundtrip(event) {
+            ProtoEvent::Input(InputEvent::Touchpad(got)) => assert_eq!(got, sent),
+            other => panic!("decoded to {other}"),
+        }
+    }
+
+    #[test]
+    fn a_full_frame_fits_one_datagram() {
+        // the whole point of batching: a frame must never be split by the
+        // wire buffer, or loss corrupts frames instead of dropping samples
+        let events: Vec<(u16, u16, i32)> = (0..MAX_FRAME_EVENTS)
+            .map(|i| (0x03, 0x35, i as i32))
+            .collect();
+        let sent = frame(&events);
+        let (_, len) =
+            <([u8; MAX_EVENT_SIZE], usize)>::from(ProtoEvent::Input(InputEvent::Touchpad(sent)));
+        assert!(len <= MAX_EVENT_SIZE, "{len} > {MAX_EVENT_SIZE}");
+        match roundtrip(ProtoEvent::Input(InputEvent::Touchpad(sent))) {
+            ProtoEvent::Input(InputEvent::Touchpad(got)) => assert_eq!(got, sent),
+            other => panic!("decoded to {other}"),
+        }
+    }
+
+    #[test]
+    fn overlong_frame_is_rejected() {
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[0] = EventType::TouchpadFrame.into();
+        buf[5] = MAX_FRAME_EVENTS as u8 + 1;
         assert!(matches!(
-            roundtrip(event),
-            ProtoEvent::Input(InputEvent::Touchpad(TouchpadEvent::Frame {
-                time: 0xdead_beef,
-                kind: 0x03,
-                code: 0x39,
-                value: -1,
-            }))
+            ProtoEvent::try_from(buf),
+            Err(ProtocolError::FrameTooLong(_))
         ));
     }
 

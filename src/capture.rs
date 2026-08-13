@@ -8,7 +8,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, TouchpadEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -82,6 +82,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            touchpad_description: None,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -166,6 +167,14 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    /// touchpad description held back until the connection is acknowledged
+    ///
+    /// It is the first touchpad event of a capture, so it lands inside the
+    /// `WaitingForAck` window and would be rewritten into `Enter` below and
+    /// lost. The receiver builds its virtual touchpad from it and silently
+    /// drops every frame until it arrives, so losing it disables the
+    /// touchpad for the whole crossing.
+    touchpad_description: Option<Event>,
 }
 
 impl CaptureTask {
@@ -284,6 +293,17 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            // replay the description the `Enter` rewrite ate,
+                            // ahead of the frames that follow it. `describe`
+                            // is idempotent, so a redundant one is harmless.
+                            if let Some(description) = self.touchpad_description.take() {
+                                log::debug!("sending touchpad description to client {handle}");
+                                if let Err(e) =
+                                    self.conn.send(ProtoEvent::Input(description), handle).await
+                                {
+                                    log::warn!("failed to describe touchpad to {handle}: {e}");
+                                }
+                            }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
@@ -356,6 +376,12 @@ impl CaptureTask {
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
+        // remember the geometry in case this event is about to be rewritten
+        // into `Enter`; it is replayed once the peer acknowledges
+        if let CaptureEvent::Input(e @ Event::Touchpad(TouchpadEvent::Device { .. })) = event {
+            self.touchpad_description = Some(e);
+        }
+
         let event = match event {
             CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
             CaptureEvent::Input(e) => match self.state {
@@ -374,6 +400,8 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        // the next capture re-elects its node and emits a fresh description
+        self.touchpad_description = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every key still held in the

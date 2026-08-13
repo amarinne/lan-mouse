@@ -20,7 +20,7 @@ use std::{
 };
 
 use evdev::{AbsoluteAxisCode, Device, EventStream, EventType, KeyCode, PropType};
-use input_event::{TOUCHPAD_AXIS_MAX, TouchpadEvent};
+use input_event::{MAX_FRAME_EVENTS, TOUCHPAD_AXIS_MAX, TouchpadAxisEvent, TouchpadEvent};
 
 /// Linear map from a device axis onto `0..=TOUCHPAD_AXIS_MAX`.
 #[derive(Clone, Copy)]
@@ -59,6 +59,9 @@ struct Candidate {
     slots: u8,
     pressure_max: i32,
     grabbed: bool,
+    /// frame under construction, flushed on `SYN_REPORT`
+    frame: [TouchpadAxisEvent; MAX_FRAME_EVENTS],
+    frame_len: usize,
 }
 
 impl Candidate {
@@ -87,43 +90,101 @@ impl Candidate {
         if !self.grabbed {
             return;
         }
+        // a half-built frame must not leak into the next capture
+        self.frame_len = 0;
         if let Err(e) = self.stream.device_mut().ungrab() {
             log::warn!("could not ungrab {} ({:?}): {e}", self.name, self.path);
         }
         self.grabbed = false;
     }
 
-    /// Poll one event, rescaled onto the normalized axes.
+    /// Poll until a whole frame is available, rescaled onto the normalized
+    /// axes.
+    ///
+    /// Events accumulate until the `SYN_REPORT` that ends the frame, so one
+    /// datagram carries one frame. A partial frame stays in the buffer across
+    /// polls; it is only meaningful once terminated.
     fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<TouchpadEvent>> {
-        let event = match self.stream.poll_event(cx) {
-            Poll::Ready(Ok(event)) => event,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        };
+        loop {
+            let event = match self.stream.poll_event(cx) {
+                Poll::Ready(Ok(event)) => event,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
 
-        let kind = event.event_type().0;
-        let code = event.code();
-        let mut value = event.value();
+            let kind = event.event_type().0;
+            let code = event.code();
+            let mut value = event.value();
 
-        if kind == EventType::ABSOLUTE.0 {
-            // positions are the only device-specific values; everything
-            // else (tracking ids, tool bits, pressure) is passed through
-            if code == AbsoluteAxisCode::ABS_MT_POSITION_X.0 || code == AbsoluteAxisCode::ABS_X.0 {
-                value = self.x.normalize(value);
-            } else if code == AbsoluteAxisCode::ABS_MT_POSITION_Y.0
-                || code == AbsoluteAxisCode::ABS_Y.0
-            {
-                value = self.y.normalize(value);
+            if kind == EventType::ABSOLUTE.0 {
+                // positions are the only device-specific values; everything
+                // else (tracking ids, tool bits, pressure) is passed through
+                if code == AbsoluteAxisCode::ABS_MT_POSITION_X.0 || code == AbsoluteAxisCode::ABS_X.0
+                {
+                    value = self.x.normalize(value);
+                } else if code == AbsoluteAxisCode::ABS_MT_POSITION_Y.0
+                    || code == AbsoluteAxisCode::ABS_Y.0
+                {
+                    value = self.y.normalize(value);
+                }
+            }
+
+            if !is_replayable(kind, code) {
+                continue;
+            }
+
+            let terminates_frame = kind == EventType::SYNCHRONIZATION.0;
+
+            if self.frame_len < MAX_FRAME_EVENTS {
+                self.frame[self.frame_len] = TouchpadAxisEvent { kind, code, value };
+                self.frame_len += 1;
+            } else if !terminates_frame {
+                // a frame this long is not a touchpad frame we understand;
+                // dropping the overflow keeps the terminator meaningful
+                log::debug!("touchpad frame exceeded {MAX_FRAME_EVENTS} events, truncating");
+                continue;
+            }
+
+            // flush on the terminator, or when the buffer is full: the
+            // receiver applies whatever it gets and waits for the SYN
+            if terminates_frame || self.frame_len == MAX_FRAME_EVENTS {
+                let count = self.frame_len as u8;
+                let events = self.frame;
+                self.frame_len = 0;
+                return Poll::Ready(Ok(TouchpadEvent::Frame {
+                    time: 0,
+                    count,
+                    events,
+                }));
             }
         }
-
-        Poll::Ready(Ok(TouchpadEvent::Frame {
-            time: 0,
-            kind,
-            code,
-            value,
-        }))
     }
+}
+
+/// Whether the receiver's virtual touchpad can replay this event.
+///
+/// The virtual device declares `EV_SYN`, `EV_KEY` and `EV_ABS` with a fixed
+/// set of axes, and the receiving kernel silently discards anything outside
+/// it. `MSC_TIMESTAMP` in particular arrives once per frame on both of our
+/// touchpads and would be pure wasted bandwidth.
+fn is_replayable(kind: u16, code: u16) -> bool {
+    if kind == EventType::SYNCHRONIZATION.0 || kind == EventType::KEY.0 {
+        return true;
+    }
+    if kind != EventType::ABSOLUTE.0 {
+        return false;
+    }
+    matches!(
+        AbsoluteAxisCode(code),
+        AbsoluteAxisCode::ABS_X
+            | AbsoluteAxisCode::ABS_Y
+            | AbsoluteAxisCode::ABS_PRESSURE
+            | AbsoluteAxisCode::ABS_MT_SLOT
+            | AbsoluteAxisCode::ABS_MT_POSITION_X
+            | AbsoluteAxisCode::ABS_MT_POSITION_Y
+            | AbsoluteAxisCode::ABS_MT_TRACKING_ID
+            | AbsoluteAxisCode::ABS_MT_PRESSURE
+    )
 }
 
 /// Capture of the local touchpad.
@@ -209,6 +270,8 @@ fn candidate(path: PathBuf, device: Device) -> io::Result<Candidate> {
         slots,
         pressure_max,
         grabbed: false,
+        frame: [TouchpadAxisEvent::default(); MAX_FRAME_EVENTS],
+        frame_len: 0,
     })
 }
 

@@ -132,9 +132,14 @@ pub struct InputCapture {
     /// raw touchpad forwarding, absent when the machine has no touchpad
     #[cfg(target_os = "linux")]
     touchpad: Option<evdev_touchpad::TouchpadCapture>,
-    /// handle capture is currently active for, used to route touchpad frames
+    /// position capture is currently active at, used to route touchpad frames
+    ///
+    /// A position, not a handle: several handles can share an edge - an
+    /// outgoing client and the enter-only handle of the peer's incoming
+    /// connection - and only the caller can tell which of them still wants
+    /// events. Frames therefore go through `dispatch` like every other event.
     #[cfg(target_os = "linux")]
-    active: Option<CaptureHandle>,
+    active: Option<Position>,
 }
 
 impl InputCapture {
@@ -232,8 +237,8 @@ impl InputCapture {
     /// only known once one of them reports an event, so the capture emits the
     /// description itself, ahead of the first frame.
     #[cfg(target_os = "linux")]
-    fn begin_touchpad_capture(&mut self, handle: CaptureHandle) {
-        self.active = Some(handle);
+    fn begin_touchpad_capture(&mut self, pos: Position) {
+        self.active = Some(pos);
         if let Some(touchpad) = self.touchpad.as_mut() {
             touchpad.grab();
         }
@@ -256,10 +261,11 @@ impl InputCapture {
 
         for id in ids {
             self.pending.push_back((id, event));
-            #[cfg(target_os = "linux")]
-            if event == CaptureEvent::Begin {
-                self.begin_touchpad_capture(id);
-            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if event == CaptureEvent::Begin {
+            self.begin_touchpad_capture(pos);
         }
 
         self.pending.pop_front()
@@ -307,25 +313,29 @@ impl Stream for InputCapture {
         // Backend is idle: drain touchpad frames. The grab means these are
         // the only events the local compositor is no longer seeing.
         #[cfg(target_os = "linux")]
-        if let Some(handle) = self.active {
-            if let Some(touchpad) = self.touchpad.as_mut() {
-                if touchpad.is_grabbed() {
-                    match touchpad.poll_event(cx) {
-                        Poll::Ready(Ok(frame)) => {
-                            return Poll::Ready(Some(Ok((
-                                handle,
-                                CaptureEvent::Input(Event::Touchpad(frame)),
-                            ))));
-                        }
-                        Poll::Ready(Err(e)) => {
-                            // keep pointer/keyboard capture alive; only
-                            // gesture forwarding is lost
-                            log::warn!("touchpad capture failed, releasing grab: {e}");
-                            touchpad.ungrab();
-                        }
-                        Poll::Pending => {}
+        if let Some(pos) = self.active {
+            // the borrow of `touchpad` has to end before `dispatch`
+            let polled = match self.touchpad.as_mut() {
+                Some(touchpad) if touchpad.is_grabbed() => touchpad.poll_event(cx),
+                _ => Poll::Pending,
+            };
+            match polled {
+                Poll::Ready(Ok(frame)) => {
+                    let event = CaptureEvent::Input(Event::Touchpad(frame));
+                    return match self.dispatch(pos, event) {
+                        Some(event) => Poll::Ready(Some(Ok(event))),
+                        None => Poll::Pending,
+                    };
+                }
+                Poll::Ready(Err(e)) => {
+                    // keep pointer/keyboard capture alive; only gesture
+                    // forwarding is lost
+                    log::warn!("touchpad capture failed, releasing grab: {e}");
+                    if let Some(touchpad) = self.touchpad.as_mut() {
+                        touchpad.ungrab();
                     }
                 }
+                Poll::Pending => {}
             }
         }
 
