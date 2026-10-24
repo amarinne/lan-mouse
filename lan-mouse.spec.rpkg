@@ -1,0 +1,49 @@
+# rpkg spec for the amarinne lan-mouse patches. Copy to the branch root as lan-mouse.spec.rpkg.
+# Both peers must run this build: the gesture patch changes the wire format.
+%global debug_package %{nil}
+%global version {{{ git describe --tags --long --abbrev=8 --match 'v[0-9]*' | sed 's/^v//;s/-\([0-9]*\)-g/.git.\1./' }}}
+
+Name:           lan-mouse
+Version:        %{version}
+Release:        1%{?dist}
+Summary:        Software KVM switch for local networks (amarinne patches)
+License:        GPL-3.0-only
+URL:            https://github.com/amarinne/lan-mouse
+VCS:            {{{ git_dir_vcs }}}
+Source:         {{{ git_dir_pack }}}
+
+BuildRequires:  cargo
+BuildRequires:  rust
+BuildRequires:  desktop-file-utils
+BuildRequires:  pkgconfig(gtk4)
+BuildRequires:  pkgconfig(libadwaita-1)
+BuildRequires:  pkgconfig(x11)
+BuildRequires:  pkgconfig(xtst)
+BuildRequires:  pkgconfig(xkbcommon)
+
+%description
+Mouse and keyboard sharing for local networks, with uinput shortcut injection,
+high-resolution scrolling, and touchpad gesture forwarding.
+
+%prep
+{{{ git_dir_setup_macro }}}
+
+%build
+cargo build --locked --release --all-features
+
+%install
+install -Dm755 target/release/lan-mouse %{buildroot}%{_bindir}/lan-mouse
+desktop-file-install --dir=%{buildroot}%{_datadir}/applications de.feschber.LanMouse.desktop
+install -Dm644 lan-mouse-gtk/resources/de.feschber.LanMouse.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/de.feschber.LanMouse.svg
+install -Dm644 firewall/lan-mouse.xml %{buildroot}%{_prefix}/lib/firewalld/services/lan-mouse.xml
+
+%files
+%license LICENSE
+%doc README.md DOC.md
+%{_bindir}/lan-mouse
+%{_datadir}/applications/de.feschber.LanMouse.desktop
+%{_datadir}/icons/hicolor/scalable/apps/de.feschber.LanMouse.svg
+%{_prefix}/lib/firewalld/services/lan-mouse.xml
+
+%changelog
+{{{ git_dir_changelog }}}
