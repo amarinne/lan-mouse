@@ -276,6 +276,23 @@ impl From<Status> for bool {
 #[cfg(unix)]
 const LAN_MOUSE_SOCKET_NAME: &str = "lan-mouse-socket.sock";
 
+/// Android denies the `shell` user filesystem sockets, so the IPC socket
+/// lives in the abstract namespace there.
+#[cfg(target_os = "android")]
+pub(crate) fn abstract_socket_addr() -> std::io::Result<std::os::unix::net::SocketAddr> {
+    use std::os::android::net::SocketAddrExt;
+    std::os::unix::net::SocketAddr::from_abstract_name(LAN_MOUSE_SOCKET_NAME)
+}
+
+/// Abstract sockets have no file permissions, and any app could connect to
+/// one. Only processes of the daemon's own user may control it.
+#[cfg(target_os = "android")]
+pub(crate) fn is_same_user(stream: &tokio::net::UnixStream) -> bool {
+    // SAFETY: getuid has no preconditions and cannot fail
+    let uid = unsafe { libc::getuid() };
+    stream.peer_cred().is_ok_and(|cred| cred.uid() == uid)
+}
+
 #[derive(Debug, Error)]
 pub enum SocketPathError {
     #[error("could not determine $XDG_RUNTIME_DIR: `{0}`")]

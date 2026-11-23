@@ -35,7 +35,15 @@ struct DnsTask {
 
 impl DnsResolver {
     pub(crate) fn new() -> Result<Self, ResolveError> {
+        #[cfg(not(target_os = "android"))]
         let resolver = TokioResolver::builder_tokio()?.build();
+        // Android has no resolv.conf, so clients there need IP addresses.
+        #[cfg(target_os = "android")]
+        let resolver = TokioResolver::builder_with_config(
+            hickory_resolver::config::ResolverConfig::new(),
+            hickory_resolver::name_server::TokioConnectionProvider::default(),
+        )
+        .build();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();

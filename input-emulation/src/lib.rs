@@ -17,6 +17,9 @@ mod x11;
 #[cfg(wlroots)]
 mod wlroots;
 
+#[cfg(any(wlroots, uinput))]
+mod uinput;
+
 #[cfg(rdp)]
 mod xdg_desktop_portal;
 
@@ -46,6 +49,8 @@ pub enum Backend {
     Windows,
     #[cfg(target_os = "macos")]
     MacOs,
+    #[cfg(uinput)]
+    Uinput,
     Dummy,
 }
 
@@ -64,6 +69,8 @@ impl Display for Backend {
             Backend::Windows => write!(f, "windows"),
             #[cfg(target_os = "macos")]
             Backend::MacOs => write!(f, "macos"),
+            #[cfg(uinput)]
+            Backend::Uinput => write!(f, "uinput"),
             Backend::Dummy => write!(f, "dummy"),
         }
     }
@@ -90,6 +97,10 @@ impl InputEmulation {
             Backend::Windows => Box::new(windows::WindowsEmulation::new()?),
             #[cfg(target_os = "macos")]
             Backend::MacOs => Box::new(macos::MacOSEmulation::new()?),
+            #[cfg(uinput)]
+            Backend::Uinput => {
+                Box::new(uinput::UinputEmulation::new().map_err(EmulationCreationError::Uinput)?)
+            }
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
         Ok(Self {
@@ -121,6 +132,8 @@ impl InputEmulation {
             Backend::Windows,
             #[cfg(target_os = "macos")]
             Backend::MacOs,
+            #[cfg(uinput)]
+            Backend::Uinput,
             Backend::Dummy,
         ] {
             match Self::with_backend(backend).await {

@@ -47,6 +47,7 @@ ashpd = { version = "0.13.9", default-features = false, features = [
 ], optional = true }
 reis = { version = "0.5.0", features = ["tokio"], optional = true }
 evdev = { version = "0.13.2", optional = true }
+libc = { version = "0.2.148", optional = true }
 
 [target.'cfg(target_os="macos")'.dependencies]
 bitflags = "2.6.0"
@@ -76,5 +77,7 @@ wlroots = [
     "dep:wayland-protocols-misc",
 ]
 x11 = ["dep:x11"]
+# uinput only, no display server protocol (Android)
+uinput = ["dep:evdev", "dep:libc"]
 remote_desktop_portal = ["dep:ashpd"]
 libei = ["dep:reis", "dep:ashpd"]

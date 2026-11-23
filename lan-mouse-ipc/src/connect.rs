@@ -59,10 +59,17 @@ pub fn connect() -> Result<(FrontendEventReader, FrontendRequestWriter), Connect
 /// wait for the lan-mouse socket to come online
 #[cfg(unix)]
 fn wait_for_service() -> Result<UnixStream, ConnectionError> {
+    #[cfg(not(target_os = "android"))]
     let socket_path = crate::default_socket_path()?;
+    #[cfg(target_os = "android")]
+    let socket_path = crate::abstract_socket_addr()?;
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = UnixStream::connect(&socket_path) {
+        #[cfg(not(target_os = "android"))]
+        let stream = UnixStream::connect(&socket_path);
+        #[cfg(target_os = "android")]
+        let stream = UnixStream::connect_addr(&socket_path);
+        if let Ok(stream) = stream {
             break Ok(stream);
         }
         // a signaling mechanism or inotify could be used to

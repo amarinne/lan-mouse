@@ -55,6 +55,9 @@ pub enum EmulationCreationError {
     #[cfg(windows)]
     #[error("windows: `{0}`")]
     Windows(#[from] WindowsEmulationCreationError),
+    #[cfg(uinput)]
+    #[error("uinput: `{0}`")]
+    Uinput(io::Error),
     #[error("capture error")]
     NoAvailableBackend,
 }

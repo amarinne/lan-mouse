@@ -133,6 +133,9 @@ pub enum CaptureBackend {
     #[cfg(target_os = "macos")]
     #[serde(rename = "macos")]
     MacOs,
+    #[cfg(target_os = "android")]
+    #[serde(rename = "android")]
+    Android,
     #[serde(rename = "dummy")]
     Dummy,
 }
@@ -150,6 +153,8 @@ impl Display for CaptureBackend {
             CaptureBackend::Windows => write!(f, "windows"),
             #[cfg(target_os = "macos")]
             CaptureBackend::MacOs => write!(f, "MacOS"),
+            #[cfg(target_os = "android")]
+            CaptureBackend::Android => write!(f, "android"),
             CaptureBackend::Dummy => write!(f, "dummy"),
         }
     }
@@ -168,6 +173,8 @@ impl From<CaptureBackend> for input_capture::Backend {
             CaptureBackend::Windows => Self::Windows,
             #[cfg(target_os = "macos")]
             CaptureBackend::MacOs => Self::MacOs,
+            #[cfg(target_os = "android")]
+            CaptureBackend::Android => Self::Android,
             CaptureBackend::Dummy => Self::Dummy,
         }
     }
@@ -193,6 +200,9 @@ pub enum EmulationBackend {
     #[cfg(target_os = "macos")]
     #[serde(rename = "macos")]
     MacOs,
+    #[cfg(uinput_emulation)]
+    #[serde(rename = "uinput")]
+    Uinput,
     #[serde(rename = "dummy")]
     Dummy,
 }
@@ -212,6 +222,8 @@ impl From<EmulationBackend> for input_emulation::Backend {
             EmulationBackend::Windows => Self::Windows,
             #[cfg(target_os = "macos")]
             EmulationBackend::MacOs => Self::MacOs,
+            #[cfg(uinput_emulation)]
+            EmulationBackend::Uinput => Self::Uinput,
             EmulationBackend::Dummy => Self::Dummy,
         }
     }
@@ -232,6 +244,8 @@ impl Display for EmulationBackend {
             EmulationBackend::Windows => write!(f, "windows"),
             #[cfg(target_os = "macos")]
             EmulationBackend::MacOs => write!(f, "macos"),
+            #[cfg(uinput_emulation)]
+            EmulationBackend::Uinput => write!(f, "uinput"),
             EmulationBackend::Dummy => write!(f, "dummy"),
         }
     }

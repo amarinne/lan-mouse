@@ -32,6 +32,10 @@ mod x11;
 /// fallback input capture (does not produce events)
 mod dummy;
 
+#[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod android;
+
 #[cfg(target_os = "linux")]
 mod evdev_touchpad;
 
@@ -54,7 +58,7 @@ impl Display for CaptureEvent {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub enum Position {
     Left,
     Right,
@@ -97,6 +101,8 @@ pub enum Backend {
     Windows,
     #[cfg(target_os = "macos")]
     MacOs,
+    #[cfg(target_os = "android")]
+    Android,
     Dummy,
 }
 
@@ -113,6 +119,8 @@ impl Display for Backend {
             Backend::Windows => write!(f, "windows"),
             #[cfg(target_os = "macos")]
             Backend::MacOs => write!(f, "MacOS"),
+            #[cfg(target_os = "android")]
+            Backend::Android => write!(f, "android"),
             Backend::Dummy => write!(f, "dummy"),
         }
     }
@@ -375,6 +383,10 @@ async fn create_backend(
         Backend::Windows => Ok(Box::new(windows::WindowsInputCapture::new())),
         #[cfg(target_os = "macos")]
         Backend::MacOs => Ok(Box::new(macos::MacOSInputCapture::new().await?)),
+        #[cfg(target_os = "android")]
+        Backend::Android => Ok(Box::new(
+            android::AndroidInputCapture::new().map_err(CaptureCreationError::Android)?,
+        )),
         Backend::Dummy => Ok(Box::new(dummy::DummyInputCapture::new())),
     }
 }
@@ -404,6 +416,8 @@ async fn create(
         Backend::Windows,
         #[cfg(target_os = "macos")]
         Backend::MacOs,
+        #[cfg(target_os = "android")]
+        Backend::Android,
     ] {
         match create_backend(backend).await {
             Ok(b) => {

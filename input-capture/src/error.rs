@@ -61,6 +61,9 @@ pub enum CaptureError {
 pub enum CaptureCreationError {
     #[error("no backend available")]
     NoAvailableBackend,
+    #[cfg(target_os = "android")]
+    #[error("error creating android return zone: `{0}`")]
+    Android(std::io::Error),
     #[cfg(libei)]
     #[error("error creating input-capture-portal backend: `{0}`")]
     Libei(#[from] LibeiCaptureCreationError),

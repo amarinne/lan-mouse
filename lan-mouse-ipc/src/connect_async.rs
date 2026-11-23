@@ -81,10 +81,19 @@ pub async fn connect_async(
 /// wait for the lan-mouse socket to come online
 #[cfg(unix)]
 async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
+    #[cfg(not(target_os = "android"))]
     let socket_path = crate::default_socket_path()?;
+    #[cfg(target_os = "android")]
+    let socket_path = crate::abstract_socket_addr()?;
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = UnixStream::connect(&socket_path).await {
+        #[cfg(not(target_os = "android"))]
+        let stream = UnixStream::connect(&socket_path).await;
+        #[cfg(target_os = "android")]
+        let stream = std::os::unix::net::UnixStream::connect_addr(&socket_path)
+            .and_then(|s| s.set_nonblocking(true).map(|()| s))
+            .and_then(UnixStream::from_std);
+        if let Ok(stream) = stream {
             break Ok(stream);
         }
         // a signaling mechanism or inotify could be used to

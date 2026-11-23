@@ -60,6 +60,22 @@ For more detailed information about os support see [Detailed OS Support](#detail
 A proof of concept for an Android / IOS Application by [rohitsangwan01](https://github.com/rohitsangwan01) can be found [here](https://github.com/rohitsangwan01/lan-mouse-mobile).
 It can be used as a remote control for any device supported by Lan Mouse.
 
+This fork can also run on an Android device as a receiver. The `uinput` emulation
+backend runs as the ADB `shell` user and creates a virtual keyboard, mouse and
+touchpad, so Android treats the input as a physical device.
+The `android` capture backend is a return zone: a companion app reports when the
+pointer pushes against an edge that faces a sending machine, and control returns to it.
+The protocol is in `input-capture/src/android.rs`.
+
+```sh
+scripts/android.sh build     # needs the Android NDK
+scripts/android.sh install   # authorizes this machine and starts the daemon
+scripts/android.sh start     # after each reboot of the Android device
+```
+
+On the sending machine, add the Android device as a client with its IP address.
+Android has no system DNS configuration that the receiver can read.
+
 ## Installation
 
 <details>

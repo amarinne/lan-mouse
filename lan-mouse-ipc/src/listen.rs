@@ -1,5 +1,5 @@
 use futures::{Stream, StreamExt, stream::SelectAll};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 use std::path::PathBuf;
 use std::{
     io::ErrorKind,
@@ -27,7 +27,7 @@ pub struct AsyncFrontendListener {
     listener: TcpListener,
     #[cfg(unix)]
     listener: UnixListener,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     socket_path: PathBuf,
     #[cfg(unix)]
     line_streams: SelectAll<LinesStream<BufReader<ReadHalf<UnixStream>>>>,
@@ -41,7 +41,23 @@ pub struct AsyncFrontendListener {
 
 impl AsyncFrontendListener {
     pub async fn new() -> Result<Self, IpcListenerCreationError> {
-        #[cfg(unix)]
+        #[cfg(target_os = "android")]
+        let listener = {
+            let addr = crate::abstract_socket_addr().map_err(IpcListenerCreationError::Bind)?;
+            let listener = match std::os::unix::net::UnixListener::bind_addr(&addr) {
+                Ok(ls) => ls,
+                Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                    return Err(IpcListenerCreationError::AlreadyRunning);
+                }
+                Err(e) => return Err(IpcListenerCreationError::Bind(e)),
+            };
+            listener
+                .set_nonblocking(true)
+                .and_then(|()| UnixListener::from_std(listener))
+                .map_err(IpcListenerCreationError::Bind)?
+        };
+
+        #[cfg(all(unix, not(target_os = "android")))]
         let (socket_path, listener) = {
             let socket_path = crate::default_socket_path()?;
 
@@ -82,7 +98,7 @@ impl AsyncFrontendListener {
 
         let adapter = Self {
             listener,
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_os = "android")))]
             socket_path,
             line_streams: SelectAll::new(),
             tx_streams: vec![],
@@ -113,7 +129,7 @@ impl AsyncFrontendListener {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 impl Drop for AsyncFrontendListener {
     fn drop(&mut self) {
         log::debug!("remove socket: {:?}", self.socket_path);
@@ -130,6 +146,11 @@ impl Stream for AsyncFrontendListener {
         }
         let mut sync = false;
         while let Poll::Ready(Ok((stream, _))) = self.listener.poll_accept(cx) {
+            #[cfg(target_os = "android")]
+            if !crate::is_same_user(&stream) {
+                log::warn!("rejected IPC connection from another user");
+                continue;
+            }
             let (rx, tx) = tokio::io::split(stream);
             let buf_reader = BufReader::new(rx);
             let lines = buf_reader.lines();
